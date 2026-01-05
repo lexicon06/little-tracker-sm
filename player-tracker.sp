@@ -4,9 +4,12 @@
 #include <sourcemod>
 #include <sdktools>
 
-#define PLUGIN_VERSION "3.2"
+#define PLUGIN_VERSION "3.3"
 #define DATABASE_NAME "l4dstats"
 #define UPDATE_INTERVAL 30.0
+
+// Debug logging - set to true for testing
+#define DEBUG_MODE false
 
 Database g_Database = null;
 bool g_bDatabaseConnected = false;
@@ -15,30 +18,56 @@ bool g_bDatabaseConnected = false;
 // PLAYER DATA STRUCTURES
 // ============================================
 
-// Playtime tracking
-int g_iClientJoinTime[MAXPLAYERS + 1];
-int g_iSessionPlaytime[MAXPLAYERS + 1];
+enum struct PlayerData
+{
+    char steamid[32];
+    int joinTime;
+    int sessionPlaytime;
+    
+    // Medic stats
+    int heals;
+    int revives;
+    int defibs;
+    int pills;
+    int assists;
+    
+    // Player stats
+    int kills;
+    int headshots;
+    int totalShots;
+    
+    // Points tracking
+    int pointsStartDaily;
+    int pointsStartWeekly;
+    int currentPoints;
+    
+    bool loaded;
+    bool authorized;
+    bool pendingSave;
+    
+    void Reset()
+    {
+        this.steamid[0] = '\0';
+        this.joinTime = 0;
+        this.sessionPlaytime = 0;
+        this.heals = 0;
+        this.revives = 0;
+        this.defibs = 0;
+        this.pills = 0;
+        this.assists = 0;
+        this.kills = 0;
+        this.headshots = 0;
+        this.totalShots = 0;
+        this.pointsStartDaily = 0;
+        this.pointsStartWeekly = 0;
+        this.currentPoints = 0;
+        this.loaded = false;
+        this.authorized = false;
+        this.pendingSave = false;
+    }
+}
 
-// Medic stats
-int g_iHeals[MAXPLAYERS + 1];
-int g_iRevives[MAXPLAYERS + 1];
-int g_iDefibs[MAXPLAYERS + 1];
-int g_iPills[MAXPLAYERS + 1];
-int g_iAssists[MAXPLAYERS + 1];
-
-// Player stats
-int g_iKills[MAXPLAYERS + 1];
-int g_iHeadshots[MAXPLAYERS + 1];
-int g_iTotalShots[MAXPLAYERS + 1];
-
-// Points tracking
-int g_iPointsStartDaily[MAXPLAYERS + 1];    // Points when daily reset happened
-int g_iPointsStartWeekly[MAXPLAYERS + 1];   // Points when weekly reset happened
-int g_iCurrentPoints[MAXPLAYERS + 1];       // Current points from players table
-
-// Shared
-char g_sClientSteamID[MAXPLAYERS + 1][32];
-bool g_bPlayerLoaded[MAXPLAYERS + 1];
+PlayerData g_PlayerData[MAXPLAYERS + 1];
 
 // Timer handles
 Handle g_hPlaytimeTimer = null;
@@ -48,6 +77,9 @@ Handle g_hPointsTimer = null;
 // Batch update queue
 ArrayList g_hUpdateQueue = null;
 
+// Retry queue for players without SteamID
+ArrayList g_hRetryQueue = null;
+
 // ============================================
 // PLUGIN INFO
 // ============================================
@@ -55,10 +87,10 @@ ArrayList g_hUpdateQueue = null;
 public Plugin myinfo = 
 {
     name = "L4D2 Stats Tracker",
-    author = "PabloSan",
+    author = "Your Name",
     description = "Tracks playtime, medic stats, and player performance",
     version = PLUGIN_VERSION,
-    url = "fox4dead.com"
+    url = "yourwebsite.com"
 };
 
 // ============================================
@@ -67,8 +99,15 @@ public Plugin myinfo =
 
 public void OnPluginStart()
 {
-    // Initialize update queue
+    // Initialize data structures
+    for (int i = 0; i <= MAXPLAYERS; i++)
+    {
+        g_PlayerData[i].Reset();
+    }
+    
+    // Initialize queues
     g_hUpdateQueue = new ArrayList(1024);
+    g_hRetryQueue = new ArrayList();
     
     // Connect to database
     ConnectToDatabase();
@@ -77,6 +116,9 @@ public void OnPluginStart()
     g_hPlaytimeTimer = CreateTimer(UPDATE_INTERVAL, Timer_UpdatePlaytime, _, TIMER_REPEAT);
     g_hStatsTimer = CreateTimer(60.0, Timer_UpdateStats, _, TIMER_REPEAT);
     g_hPointsTimer = CreateTimer(30.0, Timer_CheckPoints, _, TIMER_REPEAT);
+    
+    // Create retry timer
+    CreateTimer(5.0, Timer_RetryPlayers, _, TIMER_REPEAT);
     
     // Hook player events
     HookEvent("player_spawn", Event_PlayerSpawn);
@@ -95,21 +137,30 @@ public void OnPluginStart()
     HookEvent("weapon_fire", Event_WeaponFire);
     HookEvent("map_transition", Event_MapTransition);
     
+    // Late load support
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        if (IsClientInGame(client) && !IsFakeClient(client) && IsClientAuthorized(client))
+        {
+            char auth[32];
+            if (GetClientAuthId(client, AuthId_Steam2, auth, sizeof(auth)))
+            {
+                OnClientAuthorized(client, auth);
+            }
+        }
+    }
+    
     PrintToServer("[Stats Tracker] Plugin loaded successfully!");
 }
 
 public void OnPluginEnd()
 {
-    // Save all player data on plugin unload
+    // Save all valid player data on plugin unload
     for (int i = 1; i <= MaxClients; i++)
     {
-        if (IsClientInGame(i) && !IsFakeClient(i) && g_bPlayerLoaded[i])
+        if (IsClientInGame(i) && !IsFakeClient(i) && IsValidSteamID(g_PlayerData[i].steamid))
         {
-            UpdateSessionPlaytime(i);
-            SavePlayerPlaytime(i, true);
-            SavePlayerStats(i, true);
-            SaveMedicStats(i, true);
-            SavePlayerPoints(i, true);
+            SaveAllPlayerData(i, true);
         }
     }
     
@@ -135,11 +186,17 @@ public void OnPluginEnd()
         g_hPointsTimer = null;
     }
     
-    // Clean up array
+    // Clean up arrays
     if (g_hUpdateQueue != null)
     {
         delete g_hUpdateQueue;
         g_hUpdateQueue = null;
+    }
+    
+    if (g_hRetryQueue != null)
+    {
+        delete g_hRetryQueue;
+        g_hRetryQueue = null;
     }
     
     // Close database connection
@@ -150,23 +207,209 @@ public void OnPluginEnd()
     }
 }
 
-public void Event_MapTransition(Event event, const char[] name, bool dontBroadcast)
+// ============================================
+// STEAMID VALIDATION FUNCTIONS
+// ============================================
+
+bool IsValidSteamID(const char[] steamid)
 {
-    // Just save stats on map transition
-    for (int i = 1; i <= MaxClients; i++)
+    if (steamid[0] == '\0')
+        return false;
+    
+    // Check for common invalid SteamIDs
+    if (StrEqual(steamid, "STEAM_ID_STOP_IGNORING_RETVALS") ||
+        StrEqual(steamid, "STEAM_ID_PENDING") ||
+        StrEqual(steamid, "STEAM_ID_INVALID") ||
+        StrEqual(steamid, "BOT"))
     {
-        if (IsClientInGame(i) && !IsFakeClient(i) && g_bPlayerLoaded[i])
+        return false;
+    }
+    
+    // Check if it starts with STEAM_ and has valid format
+    return (StrContains(steamid, "STEAM_") == 0 && strlen(steamid) > 10);
+}
+
+bool GetValidSteamID(int client, char[] steamid, int maxlen)
+{
+    // First check if we already have a valid SteamID stored
+    if (IsValidSteamID(g_PlayerData[client].steamid))
+    {
+        strcopy(steamid, maxlen, g_PlayerData[client].steamid);
+        return true;
+    }
+    
+    // Try to get SteamID from client
+    if (GetClientAuthId(client, AuthId_Steam2, steamid, maxlen))
+    {
+        if (IsValidSteamID(steamid))
         {
-            UpdateSessionPlaytime(i);
-            SavePlayerPlaytime(i, false);
-            SavePlayerStats(i, false);
-            SaveMedicStats(i, false);
-            SavePlayerPoints(i, false);
+            // Store it for future use
+            strcopy(g_PlayerData[client].steamid, sizeof(PlayerData::steamid), steamid);
+            return true;
         }
     }
     
-    // Process queue
-    ProcessUpdateQueue();
+    return false;
+}
+
+// ============================================
+// CLIENT CONNECTION/DISCONNECTION
+// ============================================
+
+public void OnClientAuthorized(int client, const char[] auth)
+{
+    if (IsFakeClient(client))
+        return;
+    
+    if (DEBUG_MODE) PrintToServer("[DEBUG] OnClientAuthorized: %d - %s", client, auth);
+    
+    // Validate SteamID before storing
+    if (IsValidSteamID(auth))
+    {
+        strcopy(g_PlayerData[client].steamid, sizeof(PlayerData::steamid), auth);
+        g_PlayerData[client].authorized = true;
+        
+        if (DEBUG_MODE) PrintToServer("[DEBUG] Valid SteamID stored: %s", auth);
+        
+        // Queue player for initialization
+        AddToRetryQueue(client);
+    }
+    else
+    {
+        if (DEBUG_MODE) PrintToServer("[DEBUG] Invalid SteamID: %s", auth);
+    }
+}
+
+public void OnClientDisconnect(int client)
+{
+    if (IsFakeClient(client))
+        return;
+    
+    char steamid[32];
+    if (GetValidSteamID(client, steamid, sizeof(steamid)))
+    {
+        if (g_PlayerData[client].loaded)
+        {
+            if (DEBUG_MODE) PrintToServer("[DEBUG] Saving data for %s on disconnect", steamid);
+            SaveAllPlayerData(client, true);
+        }
+        else
+        {
+            if (DEBUG_MODE) PrintToServer("[DEBUG] Player %s never loaded, no data to save", steamid);
+        }
+    }
+    else
+    {
+        if (DEBUG_MODE) PrintToServer("[DEBUG] Client %d disconnected without valid SteamID", client);
+    }
+    
+    // Always reset data on disconnect
+    g_PlayerData[client].Reset();
+    
+    // Remove from retry queue
+    RemoveFromRetryQueue(client);
+}
+
+void InitializePlayerData(int client)
+{
+    char steamid[32];
+    if (!GetValidSteamID(client, steamid, sizeof(steamid)))
+    {
+        if (DEBUG_MODE) PrintToServer("[DEBUG] Cannot initialize player %d - no valid SteamID", client);
+        return;
+    }
+    
+    if (DEBUG_MODE) PrintToServer("[DEBUG] Initializing player %s", steamid);
+    
+    g_PlayerData[client].joinTime = GetTime();
+    g_PlayerData[client].sessionPlaytime = 0;
+    
+    g_PlayerData[client].heals = 0;
+    g_PlayerData[client].revives = 0;
+    g_PlayerData[client].defibs = 0;
+    g_PlayerData[client].pills = 0;
+    g_PlayerData[client].assists = 0;
+    
+    g_PlayerData[client].kills = 0;
+    g_PlayerData[client].headshots = 0;
+    g_PlayerData[client].totalShots = 0;
+    
+    g_PlayerData[client].pointsStartDaily = 0;
+    g_PlayerData[client].pointsStartWeekly = 0;
+    g_PlayerData[client].currentPoints = 0;
+    
+    g_PlayerData[client].loaded = false;
+    g_PlayerData[client].pendingSave = false;
+    
+    LoadPlayerData(client);
+}
+
+// ============================================
+// RETRY QUEUE SYSTEM
+// ============================================
+
+void AddToRetryQueue(int client)
+{
+    if (!IsClientInGame(client) || IsFakeClient(client))
+        return;
+    
+    // Check if already in queue
+    for (int i = 0; i < g_hRetryQueue.Length; i++)
+    {
+        if (g_hRetryQueue.Get(i) == client)
+            return;
+    }
+    
+    g_hRetryQueue.Push(client);
+    
+    if (DEBUG_MODE) PrintToServer("[DEBUG] Added client %d to retry queue", client);
+}
+
+void RemoveFromRetryQueue(int client)
+{
+    int index = g_hRetryQueue.FindValue(client);
+    if (index != -1)
+    {
+        g_hRetryQueue.Erase(index);
+        if (DEBUG_MODE) PrintToServer("[DEBUG] Removed client %d from retry queue", client);
+    }
+}
+
+public Action Timer_RetryPlayers(Handle timer)
+{
+    if (g_hRetryQueue.Length == 0)
+        return Plugin_Continue;
+    
+    for (int i = 0; i < g_hRetryQueue.Length; i++)
+    {
+        int client = g_hRetryQueue.Get(i);
+        
+        if (!IsClientInGame(client) || IsFakeClient(client))
+        {
+            g_hRetryQueue.Erase(i);
+            i--;
+            continue;
+        }
+        
+        char steamid[32];
+        if (GetValidSteamID(client, steamid, sizeof(steamid)))
+        {
+            if (!g_PlayerData[client].loaded)
+            {
+                if (DEBUG_MODE) PrintToServer("[DEBUG] Retry loading player %s", steamid);
+                InitializePlayerData(client);
+            }
+            
+            // Remove from queue once loaded
+            if (g_PlayerData[client].loaded)
+            {
+                g_hRetryQueue.Erase(i);
+                i--;
+            }
+        }
+    }
+    
+    return Plugin_Continue;
 }
 
 // ============================================
@@ -236,109 +479,47 @@ public Action Timer_Reconnect(Handle timer)
 }
 
 // ============================================
-// PLAYER CONNECTION/DISCONNECTION
-// ============================================
-
-public void OnClientPostAdminCheck(int client)
-{
-    if (IsFakeClient(client))
-        return;
-    
-    // Get SteamID
-    if (!GetClientAuthId(client, AuthId_Steam2, g_sClientSteamID[client], sizeof(g_sClientSteamID[])))
-    {
-        LogError("Failed to get SteamID for client %d", client);
-        return;
-    }
-    
-    // Initialize all stats
-    g_iClientJoinTime[client] = GetTime();
-    g_iSessionPlaytime[client] = 0;
-    
-    g_iHeals[client] = 0;
-    g_iRevives[client] = 0;
-    g_iDefibs[client] = 0;
-    g_iPills[client] = 0;
-    g_iAssists[client] = 0;
-    
-    g_iKills[client] = 0;
-    g_iHeadshots[client] = 0;
-    g_iTotalShots[client] = 0;
-    
-    // Points tracking
-    g_iPointsStartDaily[client] = 0;
-    g_iPointsStartWeekly[client] = 0;
-    g_iCurrentPoints[client] = 0;
-    
-    g_bPlayerLoaded[client] = false;
-    
-    // Load player data from all tables
-    LoadPlayerData(client);
-}
-
-public void OnClientDisconnect(int client)
-{
-    if (IsFakeClient(client) || !g_bPlayerLoaded[client])
-        return;
-    
-    // Update and save all stats
-    UpdateSessionPlaytime(client);
-    SavePlayerPlaytime(client, true);
-    SavePlayerStats(client, true);
-    SaveMedicStats(client, true);
-    SavePlayerPoints(client, true);
-    
-    // Reset all data
-    ResetPlayerData(client);
-}
-
-void ResetPlayerData(int client)
-{
-    g_iClientJoinTime[client] = 0;
-    g_iSessionPlaytime[client] = 0;
-    
-    g_iHeals[client] = 0;
-    g_iRevives[client] = 0;
-    g_iDefibs[client] = 0;
-    g_iPills[client] = 0;
-    g_iAssists[client] = 0;
-    
-    g_iKills[client] = 0;
-    g_iHeadshots[client] = 0;
-    g_iTotalShots[client] = 0;
-    
-    // Points tracking
-    g_iPointsStartDaily[client] = 0;
-    g_iPointsStartWeekly[client] = 0;
-    g_iCurrentPoints[client] = 0;
-    
-    g_sClientSteamID[client][0] = '\0';
-    g_bPlayerLoaded[client] = false;
-}
-
-// ============================================
-// DATA LOADING & MANAGEMENT
+// DATA LOADING & SAVING
 // ============================================
 
 void LoadPlayerData(int client)
 {
+    char steamid[32];
+    if (!GetValidSteamID(client, steamid, sizeof(steamid)))
+    {
+        LogError("Cannot load player data - no valid SteamID for client %d", client);
+        return;
+    }
+    
     if (g_Database == null || !g_bDatabaseConnected)
     {
         LogError("Cannot load player data - database not connected");
         return;
     }
     
-    // Check if player exists in playtime table
+    if (DEBUG_MODE) PrintToServer("[DEBUG] Loading data for %s", steamid);
+    
     char query[256];
     g_Database.Format(query, sizeof(query),
         "SELECT steamid FROM player_playtime WHERE steamid = '%s' LIMIT 1",
-        g_sClientSteamID[client]);
+        steamid);
     
-    g_Database.Query(SQL_CheckPlayerExists, query, GetClientUserId(client));
+    DataPack pack = new DataPack();
+    pack.WriteCell(GetClientUserId(client));
+    pack.WriteString(steamid);
+    pack.Reset();
+    
+    g_Database.Query(SQL_CheckPlayerExists, query, pack);
 }
 
-public void SQL_CheckPlayerExists(Database db, DBResultSet results, const char[] error, any userid)
+public void SQL_CheckPlayerExists(Database db, DBResultSet results, const char[] error, any data)
 {
+    DataPack pack = view_as<DataPack>(data);
+    int userid = pack.ReadCell();
+    char steamid[32];
+    pack.ReadString(steamid, sizeof(steamid));
+    delete pack;
+    
     int client = GetClientOfUserId(userid);
     if (client == 0)
         return;
@@ -351,17 +532,17 @@ public void SQL_CheckPlayerExists(Database db, DBResultSet results, const char[]
     
     if (results.FetchRow())
     {
-        // Player exists, load data including points
-        LoadPlayerResetDates(client);
+        // Player exists, load full data
+        LoadPlayerResetDates(client, steamid);
     }
     else
     {
         // New player, insert into all tables
-        InsertNewPlayer(client);
+        InsertNewPlayer(client, steamid);
     }
 }
 
-void LoadPlayerResetDates(int client)
+void LoadPlayerResetDates(int client, const char[] steamid)
 {
     if (g_Database == null || !g_bDatabaseConnected)
         return;
@@ -375,14 +556,547 @@ void LoadPlayerResetDates(int client)
             (SELECT DATE(last_weekly_reset) FROM medic_stats WHERE steamid = '%s'), \
             (SELECT DATE(last_daily_reset) FROM player_stats WHERE steamid = '%s'), \
             (SELECT DATE(last_weekly_reset) FROM player_stats WHERE steamid = '%s')",
-        g_sClientSteamID[client], g_sClientSteamID[client], g_sClientSteamID[client],
-        g_sClientSteamID[client], g_sClientSteamID[client], g_sClientSteamID[client]);
+        steamid, steamid, steamid, steamid, steamid, steamid);
     
-    g_Database.Query(SQL_LoadResetDatesCallback, query, GetClientUserId(client));
+    DataPack pack = new DataPack();
+    pack.WriteCell(GetClientUserId(client));
+    pack.WriteString(steamid);
+    pack.Reset();
+    
+    g_Database.Query(SQL_LoadResetDatesCallback, query, pack);
 }
 
-public void SQL_LoadResetDatesCallback(Database db, DBResultSet results, const char[] error, any userid)
+void InsertNewPlayer(int client, const char[] steamid)
 {
+    if (g_Database == null || !g_bDatabaseConnected)
+        return;
+    
+    char name[MAX_NAME_LENGTH];
+    GetClientName(client, name, sizeof(name));
+    
+    char escapedName[MAX_NAME_LENGTH * 2 + 1];
+    g_Database.Escape(name, escapedName, sizeof(escapedName));
+    
+    char currentDate[20];
+    FormatTime(currentDate, sizeof(currentDate), "%Y-%m-%d");
+    
+    // Insert into all three tables
+    Transaction txn = new Transaction();
+    
+    char query[512];
+    
+    // Playtime table
+    g_Database.Format(query, sizeof(query),
+        "INSERT INTO player_playtime (steamid, player_name, last_join, last_daily_reset, last_weekly_reset) \
+         VALUES ('%s', '%s', NOW(), '%s', '%s')",
+        steamid, escapedName, currentDate, currentDate);
+    txn.AddQuery(query);
+    
+    // Medic stats table
+    g_Database.Format(query, sizeof(query),
+        "INSERT INTO medic_stats (steamid, player_name, last_daily_reset, last_weekly_reset) \
+         VALUES ('%s', '%s', '%s', '%s')",
+        steamid, escapedName, currentDate, currentDate);
+    txn.AddQuery(query);
+    
+    // Player stats table
+    g_Database.Format(query, sizeof(query),
+        "INSERT INTO player_stats (steamid, player_name, last_daily_reset, last_weekly_reset, \
+                                   daily_points_start, daily_points_current, \
+                                   weekly_points_start, weekly_points_current) \
+         VALUES ('%s', '%s', '%s', '%s', 0, 0, 0, 0)",
+        steamid, escapedName, currentDate, currentDate);
+    txn.AddQuery(query);
+    
+    DataPack pack = new DataPack();
+    pack.WriteCell(GetClientUserId(client));
+    pack.WriteString(steamid);
+    pack.Reset();
+    
+    g_Database.Execute(txn, SQL_InsertAllSuccess, SQL_InsertAllFailure, pack);
+}
+
+void SaveAllPlayerData(int client, bool disconnect = false)
+{
+    char steamid[32];
+    if (!GetValidSteamID(client, steamid, sizeof(steamid)))
+    {
+        if (DEBUG_MODE) PrintToServer("[DEBUG] Cannot save data for client %d - no valid SteamID", client);
+        return;
+    }
+    
+    if (!g_PlayerData[client].loaded)
+    {
+        if (DEBUG_MODE) PrintToServer("[DEBUG] Player %s not loaded, skipping save", steamid);
+        return;
+    }
+    
+    // Update session playtime before saving
+    UpdateSessionPlaytime(client);
+    
+    // Save all data types
+    SavePlayerPlaytime(client, disconnect);
+    SavePlayerStats(client, disconnect);
+    SaveMedicStats(client, disconnect);
+    SavePlayerPoints(client, disconnect);
+    
+    if (DEBUG_MODE) PrintToServer("[DEBUG] All data saved for %s", steamid);
+}
+
+void UpdateSessionPlaytime(int client)
+{
+    if (g_PlayerData[client].joinTime == 0)
+        return;
+    
+    int currentTime = GetTime();
+    int sessionTime = currentTime - g_PlayerData[client].joinTime;
+    
+    if (sessionTime > 0)
+    {
+        g_PlayerData[client].sessionPlaytime += sessionTime;
+        g_PlayerData[client].joinTime = currentTime;
+    }
+}
+
+void SavePlayerPlaytime(int client, bool disconnect = false)
+{
+    if (!g_PlayerData[client].loaded || g_PlayerData[client].sessionPlaytime <= 0 || !g_bDatabaseConnected)
+        return;
+    
+    char steamid[32];
+    if (!GetValidSteamID(client, steamid, sizeof(steamid)))
+        return;
+    
+    char name[MAX_NAME_LENGTH];
+    GetClientName(client, name, sizeof(name));
+    
+    char escapedName[MAX_NAME_LENGTH * 2 + 1];
+    g_Database.Escape(name, escapedName, sizeof(escapedName));
+    
+    char query[512];
+    if (disconnect)
+    {
+        g_Database.Format(query, sizeof(query),
+            "UPDATE player_playtime SET \
+                playtime = playtime + %d, \
+                daily_playtime = daily_playtime + %d, \
+                weekly_playtime = weekly_playtime + %d, \
+                player_name = '%s', \
+                last_join = NOW() \
+             WHERE steamid = '%s'",
+            g_PlayerData[client].sessionPlaytime,
+            g_PlayerData[client].sessionPlaytime,
+            g_PlayerData[client].sessionPlaytime,
+            escapedName,
+            steamid);
+    }
+    else
+    {
+        g_Database.Format(query, sizeof(query),
+            "UPDATE player_playtime SET \
+                playtime = playtime + %d, \
+                daily_playtime = daily_playtime + %d, \
+                weekly_playtime = weekly_playtime + %d, \
+                player_name = '%s' \
+             WHERE steamid = '%s'",
+            g_PlayerData[client].sessionPlaytime,
+            g_PlayerData[client].sessionPlaytime,
+            g_PlayerData[client].sessionPlaytime,
+            escapedName,
+            steamid);
+    }
+    
+    QueueUpdate(query);
+    
+    // Reset session time
+    g_PlayerData[client].sessionPlaytime = 0;
+}
+
+void SaveMedicStats(int client, bool disconnect = false)
+{
+    if (!g_PlayerData[client].loaded || g_Database == null || !g_bDatabaseConnected)
+        return;
+    
+    char steamid[32];
+    if (!GetValidSteamID(client, steamid, sizeof(steamid)))
+        return;
+    
+    // Only save if there's something to save
+    if (g_PlayerData[client].heals == 0 && g_PlayerData[client].revives == 0 && 
+        g_PlayerData[client].defibs == 0 && g_PlayerData[client].pills == 0 && 
+        g_PlayerData[client].assists == 0)
+        return;
+    
+    char name[MAX_NAME_LENGTH];
+    GetClientName(client, name, sizeof(name));
+    
+    char escapedName[MAX_NAME_LENGTH * 2 + 1];
+    g_Database.Escape(name, escapedName, sizeof(escapedName));
+    
+    char query[1024];
+    g_Database.Format(query, sizeof(query),
+        "UPDATE medic_stats SET \
+            total_heals = total_heals + %d, \
+            total_revives = total_revives + %d, \
+            total_defibs = total_defibs + %d, \
+            total_pills = total_pills + %d, \
+            total_assists = total_assists + %d, \
+            daily_heals = daily_heals + %d, \
+            daily_revives = daily_revives + %d, \
+            daily_defibs = daily_defibs + %d, \
+            daily_pills = daily_pills + %d, \
+            daily_assists = daily_assists + %d, \
+            weekly_heals = weekly_heals + %d, \
+            weekly_revives = weekly_revives + %d, \
+            weekly_defibs = weekly_defibs + %d, \
+            weekly_pills = weekly_pills + %d, \
+            weekly_assists = weekly_assists + %d, \
+            player_name = '%s' \
+         WHERE steamid = '%s'",
+        g_PlayerData[client].heals, g_PlayerData[client].revives, g_PlayerData[client].defibs, 
+        g_PlayerData[client].pills, g_PlayerData[client].assists,
+        g_PlayerData[client].heals, g_PlayerData[client].revives, g_PlayerData[client].defibs, 
+        g_PlayerData[client].pills, g_PlayerData[client].assists,
+        g_PlayerData[client].heals, g_PlayerData[client].revives, g_PlayerData[client].defibs, 
+        g_PlayerData[client].pills, g_PlayerData[client].assists,
+        escapedName, steamid);
+    
+    QueueUpdate(query);
+    
+    // Reset session stats
+    g_PlayerData[client].heals = 0;
+    g_PlayerData[client].revives = 0;
+    g_PlayerData[client].defibs = 0;
+    g_PlayerData[client].pills = 0;
+    g_PlayerData[client].assists = 0;
+}
+
+void SavePlayerStats(int client, bool disconnect = false)
+{
+    if (!g_PlayerData[client].loaded || g_Database == null || !g_bDatabaseConnected)
+        return;
+    
+    char steamid[32];
+    if (!GetValidSteamID(client, steamid, sizeof(steamid)))
+        return;
+    
+    // Only save if there's something to save
+    if (g_PlayerData[client].kills == 0 && g_PlayerData[client].headshots == 0 && 
+        g_PlayerData[client].totalShots == 0)
+        return;
+    
+    char name[MAX_NAME_LENGTH];
+    GetClientName(client, name, sizeof(name));
+    
+    char escapedName[MAX_NAME_LENGTH * 2 + 1];
+    g_Database.Escape(name, escapedName, sizeof(escapedName));
+    
+    char query[1024];
+    g_Database.Format(query, sizeof(query),
+        "UPDATE player_stats SET \
+            total_kills = total_kills + %d, \
+            total_headshots = total_headshots + %d, \
+            total_shots = total_shots + %d, \
+            daily_kills = daily_kills + %d, \
+            daily_headshots = daily_headshots + %d, \
+            daily_shots = daily_shots + %d, \
+            weekly_kills = weekly_kills + %d, \
+            weekly_headshots = weekly_headshots + %d, \
+            weekly_shots = weekly_shots + %d, \
+            player_name = '%s' \
+         WHERE steamid = '%s'",
+        g_PlayerData[client].kills, g_PlayerData[client].headshots, g_PlayerData[client].totalShots,
+        g_PlayerData[client].kills, g_PlayerData[client].headshots, g_PlayerData[client].totalShots,
+        g_PlayerData[client].kills, g_PlayerData[client].headshots, g_PlayerData[client].totalShots,
+        escapedName, steamid);
+    
+    QueueUpdate(query);
+    
+    // Reset session stats
+    g_PlayerData[client].kills = 0;
+    g_PlayerData[client].headshots = 0;
+    g_PlayerData[client].totalShots = 0;
+}
+
+void SavePlayerPoints(int client, bool disconnect = false)
+{
+    if (!g_PlayerData[client].loaded || g_Database == null || !g_bDatabaseConnected)
+        return;
+    
+    char steamid[32];
+    if (!GetValidSteamID(client, steamid, sizeof(steamid)))
+        return;
+    
+    char name[MAX_NAME_LENGTH];
+    GetClientName(client, name, sizeof(name));
+    
+    char escapedName[MAX_NAME_LENGTH * 2 + 1];
+    g_Database.Escape(name, escapedName, sizeof(escapedName));
+    
+    char query[512];
+    g_Database.Format(query, sizeof(query),
+        "UPDATE player_stats SET \
+            daily_points_current = %d, \
+            weekly_points_current = %d, \
+            player_name = '%s' \
+         WHERE steamid = '%s'",
+        g_PlayerData[client].currentPoints,
+        g_PlayerData[client].currentPoints,
+        escapedName,
+        steamid);
+    
+    QueueUpdate(query);
+}
+
+// ============================================
+// QUEUE MANAGEMENT
+// ============================================
+
+void QueueUpdate(const char[] query)
+{
+    if (g_hUpdateQueue == null)
+        return;
+    
+    char queuedQuery[1024];
+    strcopy(queuedQuery, sizeof(queuedQuery), query);
+    g_hUpdateQueue.PushString(queuedQuery);
+}
+
+void ProcessUpdateQueue()
+{
+    if (g_hUpdateQueue.Length == 0 || g_Database == null || !g_bDatabaseConnected)
+        return;
+    
+    // Start transaction for batch update
+    Transaction txn = new Transaction();
+    
+    char query[1024];
+    for (int i = 0; i < g_hUpdateQueue.Length; i++)
+    {
+        g_hUpdateQueue.GetString(i, query, sizeof(query));
+        txn.AddQuery(query);
+    }
+    
+    g_Database.Execute(txn, SQL_TransactionSuccess, SQL_TransactionFailure);
+    
+    // Clear the queue
+    g_hUpdateQueue.Clear();
+}
+
+// ============================================
+// TIMERS
+// ============================================
+
+public Action Timer_UpdatePlaytime(Handle timer)
+{
+    // Update session times for all online players with valid SteamID
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (IsClientInGame(i) && !IsFakeClient(i) && g_PlayerData[i].loaded)
+        {
+            UpdateSessionPlaytime(i);
+            
+            // Auto-save if session is long enough
+            if (g_PlayerData[i].sessionPlaytime >= 60) // Save if at least 1 minute accumulated
+            {
+                SavePlayerPlaytime(i, false);
+            }
+        }
+    }
+    
+    // Process queued updates
+    ProcessUpdateQueue();
+    
+    return Plugin_Continue;
+}
+
+public Action Timer_UpdateStats(Handle timer)
+{
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (IsClientInGame(i) && !IsFakeClient(i) && g_PlayerData[i].loaded)
+        {
+            // Save medic and player stats every minute
+            SaveMedicStats(i, false);
+            SavePlayerStats(i, false);
+        }
+    }
+    
+    return Plugin_Continue;
+}
+
+public Action Timer_CheckPoints(Handle timer)
+{
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (IsClientInGame(i) && !IsFakeClient(i) && g_PlayerData[i].loaded)
+        {
+            CheckPlayerPoints(i);
+        }
+    }
+    
+    return Plugin_Continue;
+}
+
+// ============================================
+// EVENT HANDLERS
+// ============================================
+
+public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast)
+{
+    int client = GetClientOfUserId(event.GetInt("userid"));
+    
+    if (IsValidClient(client) && !IsFakeClient(client) && !g_PlayerData[client].loaded)
+    {
+        AddToRetryQueue(client);
+    }
+}
+
+public void Event_MapTransition(Event event, const char[] name, bool dontBroadcast)
+{
+    // Save stats for all valid players on map transition
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (IsClientInGame(i) && !IsFakeClient(i) && g_PlayerData[i].loaded)
+        {
+            SaveAllPlayerData(i, false);
+        }
+    }
+    
+    // Process queue
+    ProcessUpdateQueue();
+}
+
+// Medic events
+public void Event_HealSuccess(Event event, const char[] name, bool dontBroadcast)
+{
+    int healer = GetClientOfUserId(event.GetInt("userid"));
+    
+    if (IsValidClient(healer) && !IsFakeClient(healer) && g_PlayerData[healer].loaded)
+    {
+        g_PlayerData[healer].heals++;
+    }
+}
+
+public void Event_ReviveSuccess(Event event, const char[] name, bool dontBroadcast)
+{
+    int reviver = GetClientOfUserId(event.GetInt("userid"));
+    
+    if (IsValidClient(reviver) && !IsFakeClient(reviver) && g_PlayerData[reviver].loaded)
+    {
+        g_PlayerData[reviver].revives++;
+    }
+}
+
+public void Event_DefibUsed(Event event, const char[] name, bool dontBroadcast)
+{
+    int user = GetClientOfUserId(event.GetInt("userid"));
+    
+    if (IsValidClient(user) && !IsFakeClient(user) && g_PlayerData[user].loaded)
+    {
+        g_PlayerData[user].defibs++;
+    }
+}
+
+public void Event_PillsUsed(Event event, const char[] name, bool dontBroadcast)
+{
+    int user = GetClientOfUserId(event.GetInt("userid"));
+    
+    if (IsValidClient(user) && !IsFakeClient(user) && g_PlayerData[user].loaded)
+    {
+        g_PlayerData[user].pills++;
+    }
+}
+
+public void Event_AdrenalineUsed(Event event, const char[] name, bool dontBroadcast)
+{
+    int user = GetClientOfUserId(event.GetInt("userid"));
+    
+    if (IsValidClient(user) && !IsFakeClient(user) && g_PlayerData[user].loaded)
+    {
+        g_PlayerData[user].pills++; // Count adrenaline as pills
+    }
+}
+
+public void Event_PlayerIncap(Event event, const char[] name, bool dontBroadcast)
+{
+    int attacker = GetClientOfUserId(event.GetInt("attacker"));
+    
+    // Track assists for incapping special infected
+    if (IsValidClient(attacker) && !IsFakeClient(attacker) && g_PlayerData[attacker].loaded)
+    {
+        int victim = GetClientOfUserId(event.GetInt("userid"));
+        if (IsValidClient(victim) && GetClientTeam(victim) == 3) // Team 3 = Infected
+        {
+            g_PlayerData[attacker].assists++;
+        }
+    }
+}
+
+// Player stats events
+public void Event_InfectedDeath(Event event, const char[] name, bool dontBroadcast)
+{
+    int attacker = GetClientOfUserId(event.GetInt("attacker"));
+    
+    if (!IsValidClient(attacker) || IsFakeClient(attacker) || !g_PlayerData[attacker].loaded)
+        return;
+    
+    bool headshot = event.GetBool("headshot");
+    
+    g_PlayerData[attacker].kills++;
+    if (headshot)
+        g_PlayerData[attacker].headshots++;
+}
+
+public void Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast)
+{
+    int attacker = GetClientOfUserId(event.GetInt("attacker"));
+    int victim = GetClientOfUserId(event.GetInt("userid"));
+    
+    if (!IsValidClient(attacker) || IsFakeClient(attacker) || !g_PlayerData[attacker].loaded)
+        return;
+    
+    // Only count infected team kills
+    if (IsValidClient(victim) && GetClientTeam(victim) == 3)
+    {
+        bool headshot = event.GetBool("headshot");
+        
+        g_PlayerData[attacker].kills++;
+        if (headshot)
+            g_PlayerData[attacker].headshots++;
+    }
+}
+
+public void Event_WeaponFire(Event event, const char[] name, bool dontBroadcast)
+{
+    int client = GetClientOfUserId(event.GetInt("userid"));
+    
+    if (!IsValidClient(client) || IsFakeClient(client) || !g_PlayerData[client].loaded)
+        return;
+    
+    // Only count actual firearms, not melee weapons
+    char weapon[64];
+    GetClientWeapon(client, weapon, sizeof(weapon));
+    
+    // Exclude melee weapons and chainsaw from shot count
+    if (!StrContains(weapon, "weapon_melee") && !StrEqual(weapon, "weapon_chainsaw"))
+    {
+        g_PlayerData[client].totalShots++;
+    }
+}
+
+// ============================================
+// SQL CALLBACKS
+// ============================================
+
+public void SQL_LoadResetDatesCallback(Database db, DBResultSet results, const char[] error, any data)
+{
+    DataPack pack = view_as<DataPack>(data);
+    int userid = pack.ReadCell();
+    char steamid[32];
+    pack.ReadString(steamid, sizeof(steamid));
+    delete pack;
+    
     int client = GetClientOfUserId(userid);
     if (client == 0)
         return;
@@ -395,27 +1109,12 @@ public void SQL_LoadResetDatesCallback(Database db, DBResultSet results, const c
     
     if (results.FetchRow())
     {
-        char playtimeDaily[20], playtimeWeekly[20];
-        char medicDaily[20], medicWeekly[20];
-        char playerDaily[20], playerWeekly[20];
-        
-        results.FetchString(0, playtimeDaily, sizeof(playtimeDaily));
-        results.FetchString(1, playtimeWeekly, sizeof(playtimeWeekly));
-        results.FetchString(2, medicDaily, sizeof(medicDaily));
-        results.FetchString(3, medicWeekly, sizeof(medicWeekly));
-        results.FetchString(4, playerDaily, sizeof(playerDaily));
-        results.FetchString(5, playerWeekly, sizeof(playerWeekly));
-        
-        // Load current points from players table
-        LoadCurrentPoints(client, playtimeDaily, playtimeWeekly, 
-                        medicDaily, medicWeekly,
-                        playerDaily, playerWeekly);
+        // Load current points
+        LoadCurrentPoints(client, steamid);
     }
 }
 
-void LoadCurrentPoints(int client, const char[] playtimeDaily, const char[] playtimeWeekly,
-                      const char[] medicDaily, const char[] medicWeekly,
-                      const char[] playerDaily, const char[] playerWeekly)
+void LoadCurrentPoints(int client, const char[] steamid)
 {
     if (g_Database == null || !g_bDatabaseConnected)
         return;
@@ -423,17 +1122,11 @@ void LoadCurrentPoints(int client, const char[] playtimeDaily, const char[] play
     char query[256];
     g_Database.Format(query, sizeof(query),
         "SELECT points FROM players WHERE steamid = '%s' LIMIT 1",
-        g_sClientSteamID[client]);
+        steamid);
     
-    // Create a data pack to pass multiple strings
     DataPack pack = new DataPack();
     pack.WriteCell(GetClientUserId(client));
-    pack.WriteString(playtimeDaily);
-    pack.WriteString(playtimeWeekly);
-    pack.WriteString(medicDaily);
-    pack.WriteString(medicWeekly);
-    pack.WriteString(playerDaily);
-    pack.WriteString(playerWeekly);
+    pack.WriteString(steamid);
     pack.Reset();
     
     g_Database.Query(SQL_LoadCurrentPointsCallback, query, pack);
@@ -443,18 +1136,8 @@ public void SQL_LoadCurrentPointsCallback(Database db, DBResultSet results, cons
 {
     DataPack pack = view_as<DataPack>(data);
     int userid = pack.ReadCell();
-    
-    char playtimeDaily[20], playtimeWeekly[20];
-    char medicDaily[20], medicWeekly[20];
-    char playerDaily[20], playerWeekly[20];
-    
-    pack.ReadString(playtimeDaily, sizeof(playtimeDaily));
-    pack.ReadString(playtimeWeekly, sizeof(playtimeWeekly));
-    pack.ReadString(medicDaily, sizeof(medicDaily));
-    pack.ReadString(medicWeekly, sizeof(medicWeekly));
-    pack.ReadString(playerDaily, sizeof(playerDaily));
-    pack.ReadString(playerWeekly, sizeof(playerWeekly));
-    
+    char steamid[32];
+    pack.ReadString(steamid, sizeof(steamid));
     delete pack;
     
     int client = GetClientOfUserId(userid);
@@ -470,379 +1153,101 @@ public void SQL_LoadCurrentPointsCallback(Database db, DBResultSet results, cons
     if (results.FetchRow())
     {
         int currentPoints = results.FetchInt(0);
-        g_iCurrentPoints[client] = currentPoints;
-        
-        // For existing players, load their start points from player_stats
-        LoadStartingPoints(client, playtimeDaily, playtimeWeekly, 
-                          medicDaily, medicWeekly,
-                          playerDaily, playerWeekly);
+        g_PlayerData[client].currentPoints = currentPoints;
+        g_PlayerData[client].pointsStartDaily = currentPoints;
+        g_PlayerData[client].pointsStartWeekly = currentPoints;
     }
-    else
-    {
-        // Player doesn't exist in players table, set to 0
-        g_iCurrentPoints[client] = 0;
-        g_iPointsStartDaily[client] = 0;
-        g_iPointsStartWeekly[client] = 0;
-        
-        // Now check and reset counters for all tables
-        CheckResetCounters(client, playtimeDaily, playtimeWeekly, 
-                          medicDaily, medicWeekly,
-                          playerDaily, playerWeekly);
-        
-        g_bPlayerLoaded[client] = true;
-    }
+    
+    // Mark player as loaded
+    g_PlayerData[client].loaded = true;
+    
+    if (DEBUG_MODE) PrintToServer("[DEBUG] Player %s fully loaded", steamid);
 }
 
-void LoadStartingPoints(int client, const char[] playtimeDaily, const char[] playtimeWeekly,
-                       const char[] medicDaily, const char[] medicWeekly,
-                       const char[] playerDaily, const char[] playerWeekly)
-{
-    if (g_Database == null || !g_bDatabaseConnected)
-        return;
-    
-    char query[256];
-    g_Database.Format(query, sizeof(query),
-        "SELECT daily_points_start, weekly_points_start FROM player_stats WHERE steamid = '%s' LIMIT 1",
-        g_sClientSteamID[client]);
-    
-    // Create a data pack to pass multiple strings
-    DataPack pack = new DataPack();
-    pack.WriteCell(GetClientUserId(client));
-    pack.WriteString(playtimeDaily);
-    pack.WriteString(playtimeWeekly);
-    pack.WriteString(medicDaily);
-    pack.WriteString(medicWeekly);
-    pack.WriteString(playerDaily);
-    pack.WriteString(playerWeekly);
-    pack.Reset();
-    
-    g_Database.Query(SQL_LoadStartingPointsCallback, query, pack);
-}
-
-public void SQL_LoadStartingPointsCallback(Database db, DBResultSet results, const char[] error, any data)
+public void SQL_InsertAllSuccess(Database db, any data, int numQueries, DBResultSet[] results, any[] queryData)
 {
     DataPack pack = view_as<DataPack>(data);
     int userid = pack.ReadCell();
-    
-    char playtimeDaily[20], playtimeWeekly[20];
-    char medicDaily[20], medicWeekly[20];
-    char playerDaily[20], playerWeekly[20];
-    
-    pack.ReadString(playtimeDaily, sizeof(playtimeDaily));
-    pack.ReadString(playtimeWeekly, sizeof(playtimeWeekly));
-    pack.ReadString(medicDaily, sizeof(medicDaily));
-    pack.ReadString(medicWeekly, sizeof(medicWeekly));
-    pack.ReadString(playerDaily, sizeof(playerDaily));
-    pack.ReadString(playerWeekly, sizeof(playerWeekly));
-    
+    char steamid[32];
+    pack.ReadString(steamid, sizeof(steamid));
     delete pack;
     
     int client = GetClientOfUserId(userid);
     if (client == 0)
         return;
     
-    if (db == null || results == null)
-    {
-        LogError("SQL_LoadStartingPointsCallback error: %s", error);
-        return;
-    }
+    // Set current points to 0 for new player
+    g_PlayerData[client].currentPoints = 0;
+    g_PlayerData[client].pointsStartDaily = 0;
+    g_PlayerData[client].pointsStartWeekly = 0;
     
-    if (results.FetchRow())
-    {
-        g_iPointsStartDaily[client] = results.FetchInt(0);
-        g_iPointsStartWeekly[client] = results.FetchInt(1);
-    }
-    else
-    {
-        // No start points found, use current points
-        g_iPointsStartDaily[client] = g_iCurrentPoints[client];
-        g_iPointsStartWeekly[client] = g_iCurrentPoints[client];
-    }
+    // Mark player as loaded
+    g_PlayerData[client].loaded = true;
     
-    // Now check and reset counters for all tables
-    CheckResetCounters(client, playtimeDaily, playtimeWeekly, 
-                      medicDaily, medicWeekly,
-                      playerDaily, playerWeekly);
-    
-    g_bPlayerLoaded[client] = true;
+    if (DEBUG_MODE) PrintToServer("[DEBUG] New player %s inserted and loaded", steamid);
 }
 
-void InsertNewPlayer(int client)
-{
-    if (g_Database == null || !g_bDatabaseConnected)
-        return;
-    
-    char name[MAX_NAME_LENGTH];
-    GetClientName(client, name, sizeof(name));
-    
-    char escapedName[MAX_NAME_LENGTH * 2 + 1];
-    g_Database.Escape(name, escapedName, sizeof(escapedName));
-    
-    char currentDate[20];
-    FormatTime(currentDate, sizeof(currentDate), "%Y-%m-%d");
-    
-    // Get current points from players table for new player
-    char pointsQuery[256];
-    g_Database.Format(pointsQuery, sizeof(pointsQuery),
-        "SELECT points FROM players WHERE steamid = '%s' LIMIT 1",
-        g_sClientSteamID[client]);
-    
-    // Create a data pack to pass strings
-    DataPack pack = new DataPack();
-    pack.WriteCell(GetClientUserId(client));
-    pack.WriteString(escapedName);
-    pack.WriteString(currentDate);
-    pack.Reset();
-    
-    g_Database.Query(SQL_GetNewPlayerPoints, pointsQuery, pack);
-}
-
-public void SQL_GetNewPlayerPoints(Database db, DBResultSet results, const char[] error, any data)
+public void SQL_InsertAllFailure(Database db, any data, int numQueries, const char[] error, int failIndex, any[] queryData)
 {
     DataPack pack = view_as<DataPack>(data);
     int userid = pack.ReadCell();
-    
-    char escapedName[MAX_NAME_LENGTH * 2 + 1];
-    char currentDate[20];
-    
-    pack.ReadString(escapedName, sizeof(escapedName));
-    pack.ReadString(currentDate, sizeof(currentDate));
-    
+    char steamid[32];
+    pack.ReadString(steamid, sizeof(steamid));
     delete pack;
     
-    int client = GetClientOfUserId(userid);
-    if (client == 0)
-        return;
-    
-    if (db == null || results == null)
-    {
-        LogError("SQL_GetNewPlayerPoints error: %s", error);
-        return;
-    }
-    
-    int currentPoints = 0;
-    if (results.FetchRow())
-    {
-        currentPoints = results.FetchInt(0);
-    }
-    
-    g_iCurrentPoints[client] = currentPoints;
-    g_iPointsStartDaily[client] = currentPoints;
-    g_iPointsStartWeekly[client] = currentPoints;
-    
-    // Insert into all three tables
-    Transaction txn = new Transaction();
-    
-    char query[512];
-    
-    // Playtime table
-    g_Database.Format(query, sizeof(query),
-        "INSERT INTO player_playtime (steamid, player_name, last_join, last_daily_reset, last_weekly_reset) \
-         VALUES ('%s', '%s', NOW(), '%s', '%s') \
-         ON DUPLICATE KEY UPDATE player_name = VALUES(player_name), last_join = VALUES(last_join)",
-        g_sClientSteamID[client], escapedName, currentDate, currentDate);
-    txn.AddQuery(query);
-    
-    // Medic stats table
-    g_Database.Format(query, sizeof(query),
-        "INSERT INTO medic_stats (steamid, player_name, last_daily_reset, last_weekly_reset) \
-         VALUES ('%s', '%s', '%s', '%s') \
-         ON DUPLICATE KEY UPDATE player_name = VALUES(player_name)",
-        g_sClientSteamID[client], escapedName, currentDate, currentDate);
-    txn.AddQuery(query);
-    
-    // Player stats table - include points tracking
-    g_Database.Format(query, sizeof(query),
-        "INSERT INTO player_stats (steamid, player_name, last_daily_reset, last_weekly_reset, \
-                                   daily_points_start, daily_points_current, \
-                                   weekly_points_start, weekly_points_current) \
-         VALUES ('%s', '%s', '%s', '%s', %d, %d, %d, %d) \
-         ON DUPLICATE KEY UPDATE player_name = VALUES(player_name)",
-        g_sClientSteamID[client], escapedName, currentDate, currentDate, 
-        currentPoints, currentPoints, currentPoints, currentPoints);
-    txn.AddQuery(query);
-    
-    g_Database.Execute(txn, SQL_InsertAllSuccess, SQL_InsertAllFailure, GetClientUserId(client));
+    LogError("Failed to insert new player %s: %s (query %d)", steamid, error, failIndex);
 }
 
-public void SQL_InsertAllSuccess(Database db, any userid, int numQueries, DBResultSet[] results, any[] queryData)
+public void SQL_TransactionSuccess(Database db, any data, int numQueries, DBResultSet[] results, any[] queryData)
 {
-    int client = GetClientOfUserId(userid);
-    if (client == 0)
-        return;
-    
-    g_bPlayerLoaded[client] = true;
+    // Transaction successful
 }
 
-public void SQL_InsertAllFailure(Database db, any userid, int numQueries, const char[] error, int failIndex, any[] queryData)
+public void SQL_TransactionFailure(Database db, any data, int numQueries, const char[] error, int failIndex, any[] queryData)
 {
-    LogError("Failed to insert new player: %s (query %d)", error, failIndex);
+    LogError("Transaction failed at query %d: %s", failIndex, error);
 }
 
 // ============================================
-// RESET COUNTERS
+// HELPER FUNCTIONS
 // ============================================
 
-void CheckResetCounters(int client, const char[] playtimeDaily, const char[] playtimeWeekly,
-                       const char[] medicDaily, const char[] medicWeekly,
-                       const char[] playerDaily, const char[] playerWeekly)
+bool IsValidClient(int client)
 {
-    if (g_Database == null || !g_bDatabaseConnected)
-        return;
-    
-    char currentDate[20];
-    FormatTime(currentDate, sizeof(currentDate), "%Y-%m-%d");
-    
-    char weekStart[20];
-    GetWeekStartDate(weekStart, sizeof(weekStart));
-    
-    Transaction txn = new Transaction();
-    bool hasQueries = false;
-    
-    // Playtime table reset
-    if (!StrEqual(playtimeDaily, currentDate))
-    {
-        char query[256];
-        g_Database.Format(query, sizeof(query),
-            "UPDATE player_playtime SET daily_playtime = 0, last_daily_reset = '%s' WHERE steamid = '%s'",
-            currentDate, g_sClientSteamID[client]);
-        txn.AddQuery(query);
-        hasQueries = true;
-    }
-    
-    if (!StrEqual(playtimeWeekly, weekStart))
-    {
-        char query[256];
-        g_Database.Format(query, sizeof(query),
-            "UPDATE player_playtime SET weekly_playtime = 0, last_weekly_reset = '%s' WHERE steamid = '%s'",
-            weekStart, g_sClientSteamID[client]);  
-        txn.AddQuery(query);  
-        hasQueries = true;  
-    }  
-      
-    // Medic stats table reset  
-    if (!StrEqual(medicDaily, currentDate))  
-    {  
-        char query[512];  
-        g_Database.Format(query, sizeof(query),  
-        "UPDATE medic_stats SET \  
-                daily_heals = 0, daily_revives = 0, daily_defibs = 0, \  
-                daily_pills = 0, daily_assists = 0, last_daily_reset = '%s' \  
-             WHERE steamid = '%s'",  
-            currentDate, g_sClientSteamID[client]);  
-        txn.AddQuery(query);  
-        hasQueries = true;  
-    }  
-      
-    if (!StrEqual(medicWeekly, weekStart))  
-    {  
-        char query[512];  
-        g_Database.Format(query, sizeof(query),  
-            "UPDATE medic_stats SET \  
-                weekly_heals = 0, weekly_revives = 0, weekly_defibs = 0, \  
-                weekly_pills = 0, weekly_assists = 0, last_weekly_reset = '%s' \  
-             WHERE steamid = '%s'",  
-            weekStart, g_sClientSteamID[client]);  
-        txn.AddQuery(query);  
-        hasQueries = true;  
-    }  
-      
-    // Player stats table reset - FIXED FOR YOUR SCHEMA
-    if (!StrEqual(playerDaily, currentDate))  
-    {  
-        char query[512];  
-        g_Database.Format(query, sizeof(query),  
-            "UPDATE player_stats SET \  
-                daily_kills = 0, daily_headshots = 0, daily_shots = 0, \  
-                daily_points_start = daily_points_current, \
-                last_daily_reset = '%s' \  
-             WHERE steamid = '%s'",  
-            currentDate, g_sClientSteamID[client]);  
-        txn.AddQuery(query);  
-        hasQueries = true;  
-        
-        // Reset daily points starting point
-        g_iPointsStartDaily[client] = g_iCurrentPoints[client];
-    }  
-      
-    if (!StrEqual(playerWeekly, weekStart))  
-    {  
-        char query[512];  
-        g_Database.Format(query, sizeof(query),  
-            "UPDATE player_stats SET \  
-                weekly_kills = 0, weekly_headshots = 0, weekly_shots = 0, \  
-                weekly_points_start = weekly_points_current, \
-                last_weekly_reset = '%s' \  
-             WHERE steamid = '%s'",  
-            weekStart, g_sClientSteamID[client]);  
-        txn.AddQuery(query);  
-        hasQueries = true;  
-        
-        // Reset weekly points starting point
-        g_iPointsStartWeekly[client] = g_iCurrentPoints[client];
-    }  
-      
-    if (hasQueries)  
-    {  
-        g_Database.Execute(txn, SQL_ResetSuccess, SQL_ResetFailure, GetClientUserId(client));  
-    }  
-    else  
-    {  
-        delete txn;  
-    }  
-}  
-  
-public void SQL_ResetSuccess(Database db, any userid, int numQueries, DBResultSet[] results, any[] queryData)  
-{  
-    int client = GetClientOfUserId(userid);
-    if (client == 0)
-        return;
-    
-    // Update local start points after reset
-    g_iPointsStartDaily[client] = g_iCurrentPoints[client];
-    g_iPointsStartWeekly[client] = g_iCurrentPoints[client];
-}  
-  
-public void SQL_ResetFailure(Database db, any userid, int numQueries, const char[] error, int failIndex, any[] queryData)  
-{  
-    LogError("Failed to reset counters: %s (query %d)", error, failIndex);  
-}  
-  
-void GetWeekStartDate(char[] buffer, int size)  
-{  
-    int time = GetTime();  
-    int dayOfWeek = GetTimeDayOfWeek(time);  
-    int daysToSubtract = (dayOfWeek == 0) ? 6 : (dayOfWeek - 1);  
-    time -= (daysToSubtract * 86400);  
-    FormatTime(buffer, size, "%Y-%m-%d", time);  
-}  
-  
-int GetTimeDayOfWeek(int timestamp)  
-{  
-    int days = timestamp / 86400;  
-    return (days + 4) % 7;  
-}  
-  
-// ============================================  
-// POINTS TRACKING FUNCTIONS  
-// ============================================  
+    return (client > 0 && client <= MaxClients && IsClientConnected(client) && IsClientInGame(client));
+}
 
 void CheckPlayerPoints(int client)
 {
-    if (!g_bPlayerLoaded[client] || g_Database == null || !g_bDatabaseConnected)
+    if (!g_PlayerData[client].loaded || g_Database == null || !g_bDatabaseConnected)
+        return;
+    
+    char steamid[32];
+    if (!GetValidSteamID(client, steamid, sizeof(steamid)))
         return;
     
     // Query current points from players table
     char query[256];
     g_Database.Format(query, sizeof(query),
         "SELECT points FROM players WHERE steamid = '%s' LIMIT 1",
-        g_sClientSteamID[client]);
+        steamid);
     
-    g_Database.Query(SQL_CheckPointsCallback, query, GetClientUserId(client));
+    DataPack pack = new DataPack();
+    pack.WriteCell(GetClientUserId(client));
+    pack.WriteString(steamid);
+    pack.Reset();
+    
+    g_Database.Query(SQL_CheckPointsCallback, query, pack);
 }
 
-public void SQL_CheckPointsCallback(Database db, DBResultSet results, const char[] error, any userid)
+public void SQL_CheckPointsCallback(Database db, DBResultSet results, const char[] error, any data)
 {
+    DataPack pack = view_as<DataPack>(data);
+    int userid = pack.ReadCell();
+    char steamid[32];
+    pack.ReadString(steamid, sizeof(steamid));
+    delete pack;
+    
     int client = GetClientOfUserId(userid);
     if (client == 0)
         return;
@@ -856,460 +1261,12 @@ public void SQL_CheckPointsCallback(Database db, DBResultSet results, const char
     if (results.FetchRow())
     {
         int newPoints = results.FetchInt(0);
-        int oldPoints = g_iCurrentPoints[client];
+        int oldPoints = g_PlayerData[client].currentPoints;
         
         if (newPoints != oldPoints)
         {
             // Update player's current points
-            g_iCurrentPoints[client] = newPoints;
-            
-            // Save points to database
-            SavePlayerPoints(client, false);
+            g_PlayerData[client].currentPoints = newPoints;
         }
     }
-}
-
-void SavePlayerPoints(int client, bool disconnect = false)
-{
-    if (!g_bPlayerLoaded[client] || g_Database == null || !g_bDatabaseConnected)
-        return;
-    
-    char name[MAX_NAME_LENGTH];
-    GetClientName(client, name, sizeof(name));
-    
-    char escapedName[MAX_NAME_LENGTH * 2 + 1];
-    g_Database.Escape(name, escapedName, sizeof(escapedName));
-    
-    // Update current points in player_stats
-    char query[512];
-    g_Database.Format(query, sizeof(query),
-        "UPDATE player_stats SET \
-            daily_points_current = %d, \
-            weekly_points_current = %d, \
-            player_name = '%s' \
-         WHERE steamid = '%s'",
-        g_iCurrentPoints[client],  // Store in daily_current
-        g_iCurrentPoints[client],  // Store in weekly_current  
-        escapedName,
-        g_sClientSteamID[client]);
-    
-    // Queue for batch update
-    char queuedQuery[512];
-    strcopy(queuedQuery, sizeof(queuedQuery), query);
-    g_hUpdateQueue.PushString(queuedQuery);
-}
-
-// ============================================  
-// PLAYTIME FUNCTIONS  
-// ============================================  
-  
-void UpdateSessionPlaytime(int client)  
-{  
-    if (g_iClientJoinTime[client] == 0)  
-        return;  
-      
-    int currentTime = GetTime();  
-    int sessionTime = currentTime - g_iClientJoinTime[client];  
-      
-    if (sessionTime > 0)  
-    {  
-        g_iSessionPlaytime[client] += sessionTime;  
-        g_iClientJoinTime[client] = currentTime;  
-    }  
-}  
-  
-void SavePlayerPlaytime(int client, bool disconnect = false)  
-{  
-    if (!g_bPlayerLoaded[client] || g_iSessionPlaytime[client] <= 0 || !g_bDatabaseConnected)  
-        return;  
-      
-    char name[MAX_NAME_LENGTH];  
-    GetClientName(client, name, sizeof(name));  
-      
-    char escapedName[MAX_NAME_LENGTH * 2 + 1];  
-    g_Database.Escape(name, escapedName, sizeof(escapedName));  
-      
-    char query[512];  
-    if (disconnect)  
-    {  
-        g_Database.Format(query, sizeof(query),  
-            "UPDATE player_playtime SET \  
-                playtime = playtime + %d, \  
-                daily_playtime = daily_playtime + %d, \  
-                weekly_playtime = weekly_playtime + %d, \  
-                player_name = '%s', \  
-                last_join = NOW() \  
-             WHERE steamid = '%s'",  
-            g_iSessionPlaytime[client],  
-            g_iSessionPlaytime[client],  
-            g_iSessionPlaytime[client],  
-            escapedName,  
-            g_sClientSteamID[client]);  
-    }  
-    else  
-    {  
-        g_Database.Format(query, sizeof(query),  
-            "UPDATE player_playtime SET \  
-                playtime = playtime + %d, \  
-                daily_playtime = daily_playtime + %d, \  
-                weekly_playtime = weekly_playtime + %d, \  
-                player_name = '%s' \  
-             WHERE steamid = '%s'",  
-            g_iSessionPlaytime[client],  
-            g_iSessionPlaytime[client],  
-            g_iSessionPlaytime[client],  
-            escapedName,  
-            g_sClientSteamID[client]);  
-    }  
-      
-    // Queue for batch update  
-    char queuedQuery[512];  
-    strcopy(queuedQuery, sizeof(queuedQuery), query);  
-    g_hUpdateQueue.PushString(queuedQuery);  
-      
-    // Reset session time  
-    g_iSessionPlaytime[client] = 0;  
-}  
-  
-// ============================================  
-// MEDIC STATS FUNCTIONS  
-// ============================================  
-  
-void SaveMedicStats(int client, bool disconnect = false)  
-{  
-    if (!g_bPlayerLoaded[client] || g_Database == null || !g_bDatabaseConnected)  
-        return;  
-      
-    // Only save if there's something to save  
-    if (g_iHeals[client] == 0 && g_iRevives[client] == 0 && g_iDefibs[client] == 0 &&   
-        g_iPills[client] == 0 && g_iAssists[client] == 0)  
-        return;  
-      
-    char name[MAX_NAME_LENGTH];  
-    GetClientName(client, name, sizeof(name));  
-      
-    char escapedName[MAX_NAME_LENGTH * 2 + 1];  
-    g_Database.Escape(name, escapedName, sizeof(escapedName));  
-      
-    char query[1024];  
-    g_Database.Format(query, sizeof(query),  
-        "UPDATE medic_stats SET \  
-            total_heals = total_heals + %d, \  
-            total_revives = total_revives + %d, \  
-            total_defibs = total_defibs + %d, \  
-            total_pills = total_pills + %d, \  
-            total_assists = total_assists + %d, \  
-            daily_heals = daily_heals + %d, \  
-            daily_revives = daily_revives + %d, \  
-            daily_defibs = daily_defibs + %d, \  
-            daily_pills = daily_pills + %d, \  
-            daily_assists = daily_assists + %d, \  
-            weekly_heals = weekly_heals + %d, \  
-            weekly_revives = weekly_revives + %d, \  
-            weekly_defibs = weekly_defibs + %d, \  
-            weekly_pills = weekly_pills + %d, \  
-            weekly_assists = weekly_assists + %d, \  
-            player_name = '%s' \  
-         WHERE steamid = '%s'",  
-        g_iHeals[client], g_iRevives[client], g_iDefibs[client], g_iPills[client], g_iAssists[client],  
-        g_iHeals[client], g_iRevives[client], g_iDefibs[client], g_iPills[client], g_iAssists[client],  
-        g_iHeals[client], g_iRevives[client], g_iDefibs[client], g_iPills[client], g_iAssists[client],  
-        escapedName, g_sClientSteamID[client]);  
-      
-    // Queue for batch update  
-    char queuedQuery[1024];  
-    strcopy(queuedQuery, sizeof(queuedQuery), query);  
-    g_hUpdateQueue.PushString(queuedQuery);  
-      
-    // Reset session stats  
-    g_iHeals[client] = 0;  
-    g_iRevives[client] = 0;  
-    g_iDefibs[client] = 0;  
-    g_iPills[client] = 0;  
-    g_iAssists[client] = 0;  
-}  
-  
-// ============================================  
-// PLAYER STATS FUNCTIONS  
-// ============================================  
-  
-void SavePlayerStats(int client, bool disconnect = false)  
-{  
-    if (!g_bPlayerLoaded[client] || g_Database == null || !g_bDatabaseConnected)  
-        return;  
-      
-    // Only save if there's something to save  
-    if (g_iKills[client] == 0 && g_iHeadshots[client] == 0 && g_iTotalShots[client] == 0)  
-        return;  
-      
-    char name[MAX_NAME_LENGTH];  
-    GetClientName(client, name, sizeof(name));  
-      
-    char escapedName[MAX_NAME_LENGTH * 2 + 1];  
-    g_Database.Escape(name, escapedName, sizeof(escapedName));  
-      
-    char query[1024];  
-    g_Database.Format(query, sizeof(query),  
-        "UPDATE player_stats SET \  
-            total_kills = total_kills + %d, \  
-            total_headshots = total_headshots + %d, \  
-            total_shots = total_shots + %d, \  
-            daily_kills = daily_kills + %d, \  
-            daily_headshots = daily_headshots + %d, \  
-            daily_shots = daily_shots + %d, \  
-            weekly_kills = weekly_kills + %d, \  
-            weekly_headshots = weekly_headshots + %d, \  
-            weekly_shots = weekly_shots + %d, \  
-            player_name = '%s' \  
-         WHERE steamid = '%s'",  
-        g_iKills[client], g_iHeadshots[client], g_iTotalShots[client],  
-        g_iKills[client], g_iHeadshots[client], g_iTotalShots[client],  
-        g_iKills[client], g_iHeadshots[client], g_iTotalShots[client],  
-        escapedName, g_sClientSteamID[client]);  
-      
-    // Queue for batch update  
-    char queuedQuery[1024];  
-    strcopy(queuedQuery, sizeof(queuedQuery), query);  
-    g_hUpdateQueue.PushString(queuedQuery);  
-      
-    // Reset session stats  
-    g_iKills[client] = 0;  
-    g_iHeadshots[client] = 0;  
-    g_iTotalShots[client] = 0;  
-}  
-  
-// ============================================  
-// TIMERS  
-// ============================================  
-  
-public Action Timer_UpdatePlaytime(Handle timer)  
-{  
-    // Update session times for all online players  
-    for (int i = 1; i <= MaxClients; i++)  
-    {  
-        if (IsClientInGame(i) && !IsFakeClient(i) && g_bPlayerLoaded[i])  
-        {  
-            UpdateSessionPlaytime(i);  
-              
-            // Auto-save if session is long enough  
-            if (g_iSessionPlaytime[i] >= 60) // Save if at least 1 minute accumulated  
-            {  
-                SavePlayerPlaytime(i);  
-            }  
-        }  
-    }  
-      
-    // Process queued updates  
-    ProcessUpdateQueue();  
-      
-    return Plugin_Continue;  
-}  
-  
-public Action Timer_UpdateStats(Handle timer)  
-{  
-    for (int i = 1; i <= MaxClients; i++)  
-    {  
-        if (IsClientInGame(i) && !IsFakeClient(i) && g_bPlayerLoaded[i])  
-        {  
-            // Save medic and player stats every minute  
-            SaveMedicStats(i, false);  
-            SavePlayerStats(i, false);  
-        }  
-    }  
-      
-    return Plugin_Continue;  
-}
-
-// Timer to check points
-public Action Timer_CheckPoints(Handle timer)
-{
-    for (int i = 1; i <= MaxClients; i++)
-    {
-        if (IsClientInGame(i) && !IsFakeClient(i) && g_bPlayerLoaded[i])
-        {
-            CheckPlayerPoints(i);
-        }
-    }
-    
-    return Plugin_Continue;
-}
-  
-void ProcessUpdateQueue()  
-{  
-    if (g_hUpdateQueue.Length == 0 || g_Database == null || !g_bDatabaseConnected)  
-        return;  
-      
-    // Start transaction for batch update  
-    Transaction txn = new Transaction();  
-      
-    char query[1024];  
-    for (int i = 0; i < g_hUpdateQueue.Length; i++)  
-    {  
-        g_hUpdateQueue.GetString(i, query, sizeof(query));  
-        txn.AddQuery(query);  
-    }  
-      
-    g_Database.Execute(txn, SQL_TransactionSuccess, SQL_TransactionFailure);  
-      
-    // Clear the queue  
-    g_hUpdateQueue.Clear();  
-}  
-  
-public void SQL_TransactionSuccess(Database db, any data, int numQueries, DBResultSet[] results, any[] queryData)  
-{  
-    // Transaction successful
-}  
-  
-public void SQL_TransactionFailure(Database db, any data, int numQueries, const char[] error, int failIndex, any[] queryData)  
-{  
-    LogError("Transaction failed at query %d: %s", failIndex, error);  
-}  
-  
-public void SQL_GenericCallback(Database db, DBResultSet results, const char[] error, any data)
-{
-    if (error[0])
-    {
-        LogError("SQL_GenericCallback error: %s", error);
-    }
-}
-  
-// ============================================  
-// EVENT HANDLERS  
-// ============================================  
-  
-public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast)  
-{  
-    int client = GetClientOfUserId(event.GetInt("userid"));  
-      
-    if (IsValidClient(client) && !IsFakeClient(client) && !g_bPlayerLoaded[client])  
-    {  
-        LoadPlayerData(client);  
-    }  
-}  
-  
-// Medic events  
-public void Event_HealSuccess(Event event, const char[] name, bool dontBroadcast)  
-{  
-    int healer = GetClientOfUserId(event.GetInt("userid"));  
-      
-    if (IsValidClient(healer) && !IsFakeClient(healer) && g_bPlayerLoaded[healer])  
-    {  
-        g_iHeals[healer]++;  
-    }  
-}  
-  
-public void Event_ReviveSuccess(Event event, const char[] name, bool dontBroadcast)  
-{  
-    int reviver = GetClientOfUserId(event.GetInt("userid"));  
-      
-    if (IsValidClient(reviver) && !IsFakeClient(reviver) && g_bPlayerLoaded[reviver])  
-    {  
-        g_iRevives[reviver]++;  
-    }  
-}  
-  
-public void Event_DefibUsed(Event event, const char[] name, bool dontBroadcast)  
-{  
-    int user = GetClientOfUserId(event.GetInt("userid"));  
-      
-    if (IsValidClient(user) && !IsFakeClient(user) && g_bPlayerLoaded[user])  
-    {  
-        g_iDefibs[user]++;  
-    }  
-}  
-  
-public void Event_PillsUsed(Event event, const char[] name, bool dontBroadcast)  
-{  
-    int user = GetClientOfUserId(event.GetInt("userid"));  
-      
-    if (IsValidClient(user) && !IsFakeClient(user) && g_bPlayerLoaded[user])  
-    {  
-        g_iPills[user]++;  
-    }  
-}  
-  
-public void Event_AdrenalineUsed(Event event, const char[] name, bool dontBroadcast)  
-{  
-    int user = GetClientOfUserId(event.GetInt("userid"));  
-      
-    if (IsValidClient(user) && !IsFakeClient(user) && g_bPlayerLoaded[user])  
-    {  
-        g_iPills[user]++; // Count adrenaline as pills  
-    }  
-}  
-  
-public void Event_PlayerIncap(Event event, const char[] name, bool dontBroadcast)  
-{  
-    int attacker = GetClientOfUserId(event.GetInt("attacker"));  
-      
-    // Track assists for incapping special infected  
-    if (IsValidClient(attacker) && !IsFakeClient(attacker) && g_bPlayerLoaded[attacker])  
-    {  
-        int victim = GetClientOfUserId(event.GetInt("userid"));  
-        if (IsValidClient(victim) && GetClientTeam(victim) == 3) // Team 3 = Infected  
-        {  
-            g_iAssists[attacker]++;  
-        }  
-    }  
-}  
-  
-// Player stats events  
-public void Event_InfectedDeath(Event event, const char[] name, bool dontBroadcast)  
-{  
-    int attacker = GetClientOfUserId(event.GetInt("attacker"));  
-      
-    if (!IsValidClient(attacker) || IsFakeClient(attacker) || !g_bPlayerLoaded[attacker])  
-        return;  
-      
-    bool headshot = event.GetBool("headshot");  
-      
-    g_iKills[attacker]++;  
-    if (headshot)  
-        g_iHeadshots[attacker]++;  
-}  
-  
-public void Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast)  
-{  
-    int attacker = GetClientOfUserId(event.GetInt("attacker"));  
-    int victim = GetClientOfUserId(event.GetInt("userid"));  
-      
-    if (!IsValidClient(attacker) || IsFakeClient(attacker) || !g_bPlayerLoaded[attacker])  
-        return;  
-      
-    // Only count infected team kills  
-    if (IsValidClient(victim) && GetClientTeam(victim) == 3)  
-    {  
-        bool headshot = event.GetBool("headshot");  
-          
-        g_iKills[attacker]++;  
-        if (headshot)  
-            g_iHeadshots[attacker]++;  
-    }  
-}  
-  
-public void Event_WeaponFire(Event event, const char[] name, bool dontBroadcast)  
-{  
-    int client = GetClientOfUserId(event.GetInt("userid"));  
-      
-    if (!IsValidClient(client) || IsFakeClient(client) || !g_bPlayerLoaded[client])  
-        return;  
-      
-    // Only count actual firearms, not melee weapons  
-    char weapon[64];  
-    GetClientWeapon(client, weapon, sizeof(weapon));  
-      
-    // Exclude melee weapons and chainsaw from shot count  
-    if (!StrContains(weapon, "weapon_melee") && !StrEqual(weapon, "weapon_chainsaw"))  
-    {  
-        g_iTotalShots[client]++;  
-    }  
-}  
-  
-// ============================================  
-// HELPER FUNCTIONS  
-// ============================================  
-  
-bool IsValidClient(int client)  
-{  
-    return (client > 0 && client <= MaxClients && IsClientConnected(client) && IsClientInGame(client));  
 }

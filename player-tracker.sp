@@ -55,10 +55,10 @@ ArrayList g_hUpdateQueue = null;
 public Plugin myinfo = 
 {
     name = "L4D2 Stats Tracker",
-    author = "Your Name",
+    author = "PabloSan",
     description = "Tracks playtime, medic stats, and player performance",
     version = PLUGIN_VERSION,
-    url = "yourwebsite.com"
+    url = "fox4dead.com"
 };
 
 // ============================================
